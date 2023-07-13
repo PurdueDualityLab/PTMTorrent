@@ -43,6 +43,7 @@ def cloneRepo(url: str, rootGitClonePath: PurePath) -> CompletedProcess:
         parsedURL: ParseResult = urlparse(url)
         pathSplit: List[str] = parsedURL.path.strip("/").split("/")
     except TypeError:
+        print(f"Error Cloning Repo {url}")
         return False
 
     if len(pathSplit) == 1:
