@@ -43,14 +43,20 @@ class ModelHubClass():
             logging.info(f"Total {self.name} {table_name} Errors: {problems.nrows()}")
             logging.debug(f"{self.name} {table_name} Errors:\n{problems.lookall()}")
 
-    def load(self, suffix: str = ""):
+    def load_csv(self, suffix: str = ""):
         for table_name, table in self.transformed_data.items():
-            table.tojson(f"{self.data_path}/{self.name}_{table_name}_{suffix}.json", default=str)
+            print(f"Saving table {table_name}")
+            etl.tocsv(table, f"{self.data_path}/csv/{self.name}_{table_name}_{suffix}.csv")
+
+    def load_json(self, suffix: str = ""):
+        for table_name, table in self.transformed_data.items():
+            print(f"Saving table {table_name}")
+            etl.tojson(table, f"{self.data_path}/json/{self.name}_{table_name}_{suffix}.json")
 
     def store(self):
         for table_name, table in self.transformed_data.items():
             print(table_name)
-            etl.tojson(table, f"{self.data_path}/{self.name}_{table_name}.json", default=str)
+            etl.tojson(table, f"{self.data_path}/csv/{self.name}_{table_name}.json", default=str)
 
     def frequency(table: Table):
         freq = table.nrows()

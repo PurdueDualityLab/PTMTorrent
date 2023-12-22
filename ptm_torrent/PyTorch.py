@@ -10,6 +10,7 @@ from petl import Table
 import logging
 import json
 from collections import OrderedDict
+from parse import get_repo_and_model_pairs_from_snippet, get_code_snippets
 
 # Select your transport with a defined url endpoint
 transport = AIOHTTPTransport(url="https://api.github.com/graphql", 
@@ -62,17 +63,26 @@ class PyTorch(ModelHubClass):
 
     def __init__(self):
         self.name = "PyTorch"
+        self.data_path = "/scratch/bell/jone2078/PTMTorrent/ptm_torrent/pytorchhub/data"
         self.transformed_data = {}
         self.transformed_data["model_hub"] = etl.fromcolumns([['url', 'name'],
                                               ['https://github.com/onnx/models', self.name]])
 
     def extract(self):
-        # variables = {
-        # "owner": "pytorch",
-        # "name": "hub"
-        # }
-        # query = gql(FILE_QUERY)
+        variables = {
+        "owner": "pytorch",
+        "name": "hub"
+        }
+        query = gql(FILE_QUERY)
 
+        files = client.execute(query, variable_values=variables)
+        markdown_files = [{
+                     "name": file["name"],
+                     "text": file["object"]["text"],
+                     "size": file["object"]["byteSize"]
+                     }
+                     for file in files["repository"]["object"]["entries"]
+                     if ".md" in file["name"]]
         # files = client.execute(query, variable_values=variables)
         with open("pytorch_files_appended.json", "r") as f:
             markdown_files = json.load(f)
@@ -92,6 +102,8 @@ class PyTorch(ModelHubClass):
 
         self.models = etl.fromdicts(model_dicts)
         logging.info(f"Extracted {etl.nrows(self.models)} models from PyTorch")
+        logging.error(f"PyTorch headers: {etl.header(self.models)}")
+        print(self.models.cut(['github-link', 'github-id', 'category']).lookall())
         logging.info(f"PyTorch headers: {etl.header(self.models)}")
 
     def verify_extraction(self):
@@ -132,12 +144,23 @@ class PyTorch(ModelHubClass):
         model_mapping["license"] = "license"
 
         self.transformed_data["model"] = etl.fieldmap(self.models, model_mapping)
+
+    def table_gen(self, table: Table, field: str):
+        field_list = list(etl.values(table, field))
+        non_null_vals = [val for val in field_list if val is not None]
+        unique_vals = set([val for val in chain.from_iterable(non_null_vals)])
+        new_table = etl.fromcolumns([[val] for val in unique_vals], header=[field])
+        return new_table
+
+    def load(self, suffix: str = ""):
+        for table_name, table in self.transformed_data.items():
+            etl.tojson(table, f"{self.data_path}/{self.name}_{table_name}_{suffix}.json")
         etl.tocsv(self.transformed_data["model"], "pytorch_transformed.csv")
         print(self.transformed_data["model"].lookall())
 
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO)
+    logging.basicConfig(level=logging.ERROR)
     pt = PyTorch()
     # pt.extract()
     pt.transform()
-    # pt.frequency(pt.transformed_data["model"])
+    pt.load_csv("model")

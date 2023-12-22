@@ -3,11 +3,22 @@ from huggingface_hub import HfApi, snapshot_download
 from huggingface_hub.hf_api import ModelInfo, DatasetInfo
 import shutil
 from sys import argv
+from itertools import chain
 
 import logging
 import petl as etl
 from petl import Table
 from collections import OrderedDict
+from typing import List, Mapping
+
+def wrap_in_list(obj):
+    if isinstance(obj, list):
+        return obj
+    else:
+        return [obj]
+
+def non_null_vals(obj):
+    return [val for val in wrap_in_list(obj) if val is not None]
 
 SCRATCH_DIR = "/scratch/bell/jone2078"
 CACHE_DIR = f"{SCRATCH_DIR}/huggingface_cache"
@@ -104,7 +115,7 @@ class HuggingFace(ModelHubClass):
     def __init__(self):
         self.name = "HuggingFace"
         self.data_path = "/scratch/bell/jone2078/PTMTorrent/ptm_torrent/huggingface/data"
-        self.transformed_data = {}        
+        self.transformed_data = {}
         self.transformed_data["model_hub"] = etl.fromcolumns([['url', 'name'],
                                               ['https://huggingface.co/models', 'HuggingFace']])
 
@@ -126,7 +137,6 @@ class HuggingFace(ModelHubClass):
 
         self.models = etl.fromdicts(dict_models)
         logging.warning(f"Found {etl.nrows(self.models)} models on HuggingFace API")
-        logging.warning(f"Found {etl.nrows(self.models.select(lambda row: row['downloads'] >= 10**6))} models on HuggingFace API")
         logging.warning(f"Model Headers: {etl.header(self.models)}")
 
         raw_datasets: list[DatasetInfo] = self.api.list_datasets(limit=amount,
@@ -170,148 +180,142 @@ class HuggingFace(ModelHubClass):
 
     # Obtains relevant data from the extracted data through transformations
     # Should result in self.transformed_data having the tables created within DB_Schema.sql
-    def transform(self, min_download: int = 1, max_download: int = 10**9):
-        self.model_transform(min_download, max_download)
-        self.dataset_transform(min_download, max_download)
+    def transform(self):
+        self.model_transform()
+        self.dataset_transform()
 
-    def model_transform(self, min_download: int = 1, max_download: int = 10**9):
+    def model_transform(self):
         self.models = self.models.progress(50000, prefix="Unpacking CardData: ").unpackdict('cardData')
         self.models = self.models.progress(50000, prefix="Unpacking Config: ").unpackdict('config')
         self.models = self.models.progress(50000, prefix="Melting: ").melt('_id')
         self.models = self.models.progress(500000, prefix="Recasting: ").recast()
         self.models = self.models.progress(50000, prefix="Sorting: ").sort('downloads', reverse=True)
+        print(self.models.header())
 
         model_mapping = OrderedDict()
         hf_tags = self.api.get_model_tags()
+        # Model Table Fields
         model_mapping['context_id'] = 'modelId'
+        model_mapping['model_hub'] = lambda row: self.name
+        model_mapping['repo_url'] = lambda row: f"https://huggingface.co/{row['modelId']}"
         model_mapping['sha'] = 'sha'
-        model_mapping['lastModified'] = 'lastModified'
-        model_mapping['tags'] = lambda row: set([tag for tag in row['tags']
+        model_mapping['downloads'] = 'downloads'
+        model_mapping['likes'] = 'likes'
+        model_mapping['original_data'] = lambda row: row
+
+        # Model Many to Many Fields
+        model_mapping['architectures'] = lambda row: list(non_null_vals(row['architectures'] or [])) or []
+        model_mapping['author'] = lambda row: list(set([row['author']])) or []
+        model_mapping['datasets'] = lambda row: list(set(non_null_vals(row['datasets'] or []) + [tag for tag in row['tags'] or [] if tag in hf_tags.dataset.values()])) or []
+        model_mapping['framework'] = lambda row: list(set(row['model_type'])) or []
+        model_mapping['language'] = lambda row: list(set(non_null_vals(row['language'] or []) + [tag for tag in row['tags'] or [] if tag in hf_tags.language.values()])) or []
+        model_mapping['library'] = lambda row: list(set(row['library_name'] + [tag for tag in row['tags'] or [] if tag in hf_tags.library.values()])) or []
+        model_mapping['license'] = lambda row: list(set(non_null_vals(row['license'] or []) + [tag for tag in row['tags'] or [] if tag in hf_tags.license.values()])) or []
+        model_mapping['paper'] = lambda row: non_null_vals([f"https://arxiv.org/abs/{tag.replace('arxiv:','')}" for tag in (row['tags'] or []) if 'arxiv:' in tag] or [])
+        model_mapping['tags'] = lambda row: list(set([tag for tag in chain.from_iterable(non_null_vals(row['tags'] or []))
                                              if ":" not in tag and
                                                 tag not in hf_tags.dataset.values() and
                                                 tag not in hf_tags.language.values() and
                                                 tag not in hf_tags.library.values() and 
-                                                tag not in hf_tags.license.values()] + ([row['pipeline_tag']] or []))
-        model_mapping['author'] = 'author'
-        model_mapping['citation'] = 'citation'
-        model_mapping['architectures'] = 'architectures'
-        model_mapping['framework'] = 'model_type'
-        model_mapping['library'] = 'library_name'
-        model_mapping['likes'] = 'likes'
-        model_mapping['downloads'] = 'downloads'
-        model_mapping['repo_url'] = lambda row: f"https://huggingface.co/{row['modelId']}"
-        model_mapping['datasets'] = 'datasets'
-        model_mapping['language'] = 'language'
-        model_mapping['license'] = 'license'
-        model_mapping['config_file'] = 'siblings'
-        model_mapping['paper'] = lambda row: [f"https://arxiv.org/abs/{tag.replace('arxiv:','')}" for tag in row['tags'] if 'arxiv:' in tag] or None
-        model_mapping['original_data'] = lambda row: row
-        snapshots = {}
-        commits = {}
-        for row in self.models.dicts():
-            logging.warning(f"{row['modelId']}: ")
-
-            if row['downloads'] >= min_download and row['downloads'] < max_download:
-                snapshots[row['modelId']] = self.downloadZipSnapshot(row['modelId'], 'model', False)
-                try:
-                    commit_info = self.api.list_repo_commits(row['modelId'])
-                    gitref_info = self.api.list_repo_refs(row['modelId'])
-                    commits[row['modelId']] = {"commits": commit_info, "gitrefs": gitref_info}
-                except:
-                    commits[row['modelId']] = None
-            else:
-                snapshots[row['modelId']] = "Out of download range"
-                commits[row['modelId']] = None
-
-            logging.warning(snapshots[row['modelId']])
+                                                tag not in hf_tags.license.values() and
+                                                tag is not None
+                                                ] + non_null_vals(row['pipeline_tag'] or []))) or []
+        model_mapping['datasets'] = lambda row: list(set(non_null_vals(row['datasets'] or []) + [tag for tag in row['tags'] or [] if tag in hf_tags.dataset.values()])) or []
 
 
-        model_mapping['snapshot'] = lambda row: snapshots[row['modelId']] or None
-        model_mapping['commit_info'] = lambda row: commits[row['modelId']] or None
+        self.transformed_data["model"] = etl.fieldmap(self.models, (model_mapping))
+        # print(etl.look(self.transformed_data["full"].cut(["context_id", "tags"]).select(lambda row: row["tags"] is None)))
+        # temp = self.transformed_data["full"].select(lambda row: row["tags"] is None).values("context_id").list()
+        # print(etl.look(self.models.cut(["modelId", "tags"]).select(lambda row: row["modelId"] in temp)))
+        # self.transformed_data["model"] = etl.cut(self.transformed_data["full"], ['context_id', 'model_hub', 'sha', 'repo_url', 'original_data', 'downloads', 'likes'])
+        # attribute_tables = ["tags", "architectures", "author", "datasets", "framework", "language", "library", "license"]
+        # for table_name in attribute_tables:
+        #     print(f"Generating {table_name} and model_to_{table_name} tables")
+        #     self.transformed_data[table_name] = self.gen_attribute_table(self.transformed_data["full"].progress(50000, prefix=f"Attribute Table {table_name}: "), table_name)
+        #     print(etl.look(self.transformed_data[table_name]))
+        #     self.transformed_data[f"model_to_{table_name}"] = self.gen_junction_table(self.transformed_data["full"].progress(50000, prefix=f"Junction Table model_to_{table_name}: "), "context_id", table_name)
+        #     print(etl.lookall(self.transformed_data[f"model_to_{table_name}"]))
 
-        self.transformed_data["model"] = self.models.progress(10000, prefix="Mapping: ").fieldmap(model_mapping)
+    def gen_attribute_table(self, table: Table, field: str) -> Table:
+        non_null_vals = [val for val in list(etl.values(table, field)) if val is not None]
+        unique_vals = set([val for val in chain.from_iterable(non_null_vals)])
+        new_table : Table = etl.fromcolumns([[val for val in unique_vals]], header=[field])
+        return new_table
 
-        # self.transformed_data["model_to_tag"] = self.transformed_data["model"].cut('context_id', 'tags')
-        # self.transformed_data["model_to_language"] = self.transformed_data["model"].cut('context_id', 'language')
-        # self.transformed_data["model_to_paper"] = self.transformed_data["model"].cut('context_id', 'paper')
-        # self.transformed_data["model_to_license"] = self.transformed_data["model"].cut('context_id', 'license')
-        # self.transformed_data["model_to_author"] = self.transformed_data["model"].cut('context_id', 'author')
-        # self.transformed_data["model_to_framework"] = self.transformed_data["model"].cut('context_id', 'framework')
-        # self.transformed_data["model_to_architecture"] = self.transformed_data["model"].cut('context_id', 'architectures')
-        # self.transformed_data["model_to_library"] = self.transformed_data["model"].cut('context_id', 'library')
-        # self.transformed_data["model_to_config_file"] = self.transformed_data["model"].cut('context_id', 'config_file')
-        # self.transformed_data["model_to_dataset"] = self.transformed_data["model"].cut('context_id', 'datasets')
+    def gen_junction_table(self, table: Table, left_field: str, right_field: str) -> Table:
+        subset_table = etl.cut(table, left_field, right_field)
+        longest_list = max([len(val) for val in list(etl.values(subset_table, right_field)) if val is not None])
+        unpacked_table = etl.unpack(subset_table, right_field, [" "]*longest_list, include_original=False)
+        melted_table = etl.melt(unpacked_table, left_field, valuefield=right_field).select(lambda row: row[right_field] is not None and row[left_field] is not None)
+        junction_table = etl.cut(melted_table, [left_field, right_field])
+        return junction_table
 
-    def dataset_transform(self, min_download: int = 1, max_download: int = 10**9):
-        self.datasets = self.datasets.unpackdict('cardData')
-        self.datasets = self.datasets.sort('downloads', reverse=True)
+    def dataset_transform(self):
+        self.datasets = self.datasets.progress(50000, prefix="Unpacking CardData: ").unpackdict('cardData')
+        self.datasets = self.datasets.progress(50000, prefix="Melting: ").melt('id')
+        self.datasets = self.datasets.progress(500000, prefix="Recasting: ").recast()
+        self.datasets = self.datasets.progress(50000, prefix="Sorting: ").sort('downloads', reverse=True)
 
         dataset_mapping = OrderedDict()
+        hf_tags = self.api.get_dataset_tags()
+        # Dataset Table Fields
         dataset_mapping['context_id'] = 'id'
+        dataset_mapping['model_hub'] = lambda row: self.name
         dataset_mapping['sha'] = 'sha'
         dataset_mapping['lastModified'] = 'lastModified'
+        dataset_mapping['repo_url'] = lambda row: f"https://huggingface.co/datasets/{row['id']}"
+        dataset_mapping['downloads'] = 'downloads'
+        dataset_mapping['likes'] = 'likes'
+
+        # Dataset Many to Many Fields
         dataset_mapping['tags'] = lambda row: set([tag for tag in row['tags']
                                              if ":" not in tag and tag not in hf_tags.language.values()] + \
-                                            (row['task_categories'] if row['task_categories'] else []) + \
-                                            (row['size_categories'] if row['size_categories'] else []) + \
-                                            (row['annotations_creators'] if row['annotations_creators'] else []) + \
-                                            (row['language_creators'] if row['language_creators'] else []) + \
-                                            (row['annotation_creators'] if row['annotation_creators'] else []))
+                                            (row['task_categories'] or []) + \
+                                            (row['size_categories'] or []) + \
+                                            (row['annotations_creators'] or []) + \
+                                            (row['language_creators'] or []) + \
+                                            (row['annotation_creators'] or []))
         dataset_mapping['author'] = 'author'
         dataset_mapping['description'] = 'description'
         dataset_mapping['citation'] = 'citation'
-        dataset_mapping['likes'] = 'likes'
-        dataset_mapping['downloads'] = 'downloads'
         dataset_mapping['type'] = 'type'
         dataset_mapping['paperswithcode_id'] = 'paperswithcode_id'
-        dataset_mapping['repo_url'] = lambda row: f"https://huggingface.co/datasets/{row['id']}"
         dataset_mapping['source'] = 'source_datasets'
-        dataset_mapping['language'] = lambda row: (row['language'] if row['language'] else []) + \
-                                                  (row['multilinguality'] if row['multilinguality'] else []) \
-                                                  if row['language'] or row['multilinguality'] else None
+        dataset_mapping['language'] = lambda row: (row['language'] or []) + (row['multilinguality'] or []) \
+                                                  if row['language'] or row['multilinguality'] else []
         dataset_mapping['license'] = 'license'
         dataset_mapping['dataset_info'] = 'dataset_info'
-        dataset_mapping['paper'] = lambda row: [f"https://arxiv.org/abs/{tag.replace('arxiv:','')}"
-                                              for tag in row['tags'] if 'arxiv:' in tag] or None
+        dataset_mapping['paper'] = lambda row: [f"https://arxiv.org/abs/{tag.replace('arxiv:','')}" for tag in row['tags'] if 'arxiv:' in tag] or None
         dataset_mapping['original_data'] = lambda row: row
-        snapshots = {}
-        commits = {}
-        for row in self.datasets.dicts():
-            logging.warning(row['id'])
-            if row['downloads'] >= min_download and row['downloads'] < max_download:
-                snapshots[row['id']] = self.downloadZipSnapshot(row['id'], 'dataset', False)
-                try:
-                    commit_info = self.api.list_repo_commits(row['id'], repo_type='datasets')
-                    gitref_info = self.api.list_repo_refs(row['id'], repo_type='datasets')
-                    commits[row['id']] = {"commits": commit_info, "gitrefs": gitref_info}
-                except:
-                    commits[row['id']] = None
-            else:
-                snapshots[row['id']] = "Out of download range"
-                commits[row['id']] = None
 
-        dataset_mapping['snapshot'] = lambda row: snapshots[row['id']] or None
-        dataset_mapping['commit_info'] = lambda row: commits[row['id']] or None
+        model_mapping['downloads'] = 'downloads'
+        model_mapping['likes'] = 'likes'
+        model_mapping['original_data'] = lambda row: row
+
+        # Model Many to Many Fields
+        model_mapping['architectures'] = lambda row: list(wrap_in_list(row['architectures'] or [])) or []
+        model_mapping['author'] = lambda row: list(set([row['author']])) or []
+        model_mapping['datasets'] = lambda row: list(set(wrap_in_list(row['datasets'] or []) + [tag for tag in row['tags'] or [] if tag in hf_tags.dataset.values()])) or []
+        model_mapping['framework'] = lambda row: list(set(row['model_type'])) or []
+        model_mapping['language'] = lambda row: list(set(wrap_in_list(row['language'] or []) + [tag for tag in row['tags'] or [] if tag in hf_tags.language.values()])) or []
+        model_mapping['library'] = lambda row: list(set(row['library_name'] + [tag for tag in row['tags'] or [] if tag in hf_tags.library.values()])) or []
+        model_mapping['license'] = lambda row: list(set(wrap_in_list(row['license'] or []) + [tag for tag in row['tags'] or [] if tag in hf_tags.license.values()])) or []
+        model_mapping['paper'] = lambda row: [f"https://arxiv.org/abs/{tag.replace('arxiv:','')}" for tag in row['tags'] or [] if 'arxiv:' in tag] or []
+        model_mapping['tags'] = lambda row: list(set([tag for tag in chain.from_iterable(non_null_vals(row['tags'] or []))
+                                             if ":" not in tag and
+                                                tag not in hf_tags.dataset.values() and
+                                                tag not in hf_tags.language.values() and
+                                                tag not in hf_tags.library.values() and 
+                                                tag not in hf_tags.license.values() and
+                                                tag is not None
+                                                ] + wrap_in_list(row['pipeline_tag'] or []))) or []
 
         self.transformed_data["dataset"] = self.datasets.fieldmap(dataset_mapping)
         logging.warning(self.transformed_data["dataset"].header())
 
-        # self.transformed_data["dataset_to_language"] = self.transformed_data["dataset"].cut('context_id', 'language')
-        # self.transformed_data["dataset_to_paper"] = self.transformed_data["dataset"].cut('context_id', 'paper')
-        # self.transformed_data["dataset_to_license"] = self.transformed_data["dataset"].cut('context_id', 'license')
-        # self.transformed_data["dataset_to_author"] = self.transformed_data["dataset"].cut('context_id', 'author')
-        # self.transformed_data["dataset_to_license"] = self.transformed_data["dataset"].cut('context_id', 'license')
-        # self.transformed_data["dataset_to_tags"] = self.transformed_data["dataset"].cut('context_id', 'tags')
-        # self.transformed_data["dataset_to_info"] = self.transformed_data["dataset"].cut('context_id', 'dataset_info')
-
 if __name__ == "__main__":
-    min = eval(argv[1])
-    if len(argv) > 2:
-        max = eval(argv[2])
-    else:
-        max = 10**9
     logging.basicConfig(level=logging.WARNING)
     hf = HuggingFace()
     hf.extract(amount=None)
-    hf.model_transform(min_download=min, max_download=max)
-    hf.load(f"{min}-{max}")
+    hf.model_transform()
+    hf.load_csv("")
