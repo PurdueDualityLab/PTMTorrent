@@ -1,4 +1,4 @@
-GITHUB_TOKEN = "bearer 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"
+GITHUB_TOKEN = "bearer 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"
 
 # Obtained and modified from https://gist.github.com/MichaelCurrin/6777b91e6374cdb5662b64b8249070ea
 FILE_QUERY = """

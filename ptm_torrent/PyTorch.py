@@ -67,20 +67,15 @@ class PyTorch(ModelHubClass):
                                               ['https://github.com/onnx/models', self.name]])
 
     def extract(self):
-        variables = {
-        "owner": "pytorch",
-        "name": "hub"
-        }
-        query = gql(FILE_QUERY)
+        # variables = {
+        # "owner": "pytorch",
+        # "name": "hub"
+        # }
+        # query = gql(FILE_QUERY)
 
-        files = client.execute(query, variable_values=variables)
-        markdown_files = [{
-                     "name": file["name"],
-                     "text": file["object"]["text"],
-                     "size": file["object"]["byteSize"]
-                     }
-                     for file in files["repository"]["object"]["entries"]
-                     if ".md" in file["name"]]
+        # files = client.execute(query, variable_values=variables)
+        with open("pytorch_files_appended.json", "r") as f:
+            markdown_files = json.load(f)
         
         model_dicts = []
         for file in markdown_files:
@@ -91,11 +86,13 @@ class PyTorch(ModelHubClass):
             info = file["text"].split("---")[1].strip().split("\n")
             model_info = {i.split(': ')[0]: i.split(': ')[1].strip()
                           for i in info}
+            model_info["repos"] = file["repos"]
+            model_info["models"] = file["models"]
             model_dicts.append(model_info)
 
         self.models = etl.fromdicts(model_dicts)
         logging.info(f"Extracted {etl.nrows(self.models)} models from PyTorch")
-        logging.debug(f"PyTorch headers: {etl.header(self.models)}")
+        logging.info(f"PyTorch headers: {etl.header(self.models)}")
 
     def verify_extraction(self):
         problems = etl.validate(self.models, constraints = self.model_constraints, header = self.model_headers)
@@ -103,41 +100,44 @@ class PyTorch(ModelHubClass):
         logging.debug(f"{self.name} model Errors:\n{problems.lookall()}")
 
     def transform(self):
-        variables = {
-            "owner": "",
-            "name": "",
-        }
-        query = gql(LICENSE_QUERY)
+        # variables = {
+        #     "owner": "",
+        #     "name": "",
+        # }
+        # query = gql(LICENSE_QUERY)
 
-        license_rows = []
-        for row in etl.dicts(self.models):
-            variables["owner"] = row["github-id"].split("/")[0]
-            variables["name"] = row["github-id"].split("/")[1]
-            result = client.execute(query, variable_values=variables)
-            license = result["repository"]["licenseInfo"]["key"] if result["repository"]["licenseInfo"] else None
-            license_rows.append(license)
+        # license_rows = []
+        # for row in etl.dicts(self.models):
+        #     variables["owner"] = row["github-id"].split("/")[0]
+        #     variables["name"] = row["github-id"].split("/")[1]
+        #     result = client.execute(query, variable_values=variables)
+        #     license = result["repository"]["licenseInfo"]["key"] if result["repository"]["licenseInfo"] else None
+        #     license_rows.append(license)
 
-        self.models = etl.addcolumn(self.models, "license", license_rows)
+        # self.models = etl.addcolumn(self.models, "license", license_rows)
+        melt_key = ['category', 'title', 'author', 'tags', 'github-link', 'github-id', 'accelerator', 'repos', 'license']
+        self.models = etl.fromjson("pytorch_files_modified.json").cutout('layout', 'background-class', 'body-class', 'summary', 'image', 'featured_image_1', 'featured_image_2', 'order', 'demo-model-link')
+        self.models = self.models.unpack('models', [' '] * 20, include_original=False)
+        self.models = self.models.convert('repos', lambda v: v[0])
+        self.models = self.models.melt(key=melt_key, variablefield='variable', valuefield='model').select(lambda row: row['model'] is not None)
+        self.models = self.models.cutout('variable')
+        print(self.models.look())
 
         model_mapping = OrderedDict()
-        model_mapping["context_id"] = "title"
-        model_mapping["repo_url"] = "github-link"
+        model_mapping["context_id"] = lambda row: f"{row['repos']}/{row['model']}"
+        model_mapping["repo_url"] = lambda row: f"github.com/{row['github-id']}"
         model_mapping["library"] = lambda row: "pytorch"
-        model_mapping["tags"] = lambda row: [word.strip() for word in row['tags'].replace('[','').replace(']','').split(',')]
+        model_mapping["tags"] = lambda row: [word.strip() for word in row['tags'].replace('[','').replace(']','').split(',')] + [row['category']] + [row['accelerator']]
         model_mapping["author"] = "author"
         model_mapping["license"] = "license"
 
         self.transformed_data["model"] = etl.fieldmap(self.models, model_mapping)
-
-        self.transformed_data["model_to_library"] = self.transformed_data["model"].cut('context_id', 'library')
-        self.transformed_data["model_to_tag"] = self.transformed_data["model"].cut('context_id', 'tags')
-        self.transformed_data["model_to_license"] = self.transformed_data["model"].cut('context_id', 'license')
-        self.transformed_data["model_to_author"] = self.transformed_data["model"].cut('context_id', 'author')
-
+        etl.tocsv(self.transformed_data["model"], "pytorch_transformed.csv")
+        print(self.transformed_data["model"].lookall())
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
     pt = PyTorch()
-    pt.extract()
+    # pt.extract()
     pt.transform()
-    pt.frequency(pt.transformed_data["model"])
+    # pt.frequency(pt.transformed_data["model"])

@@ -174,3 +174,5 @@ ptm_torrent/pytorchhub/data
 example/onnx
 example/PTMTorrent
 example/onnxmodelzoo.tar.gz
+**.json
+**.csv
